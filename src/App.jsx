@@ -2010,7 +2010,7 @@ export default function App() {
 						>
 							×
 						</button>
-						<p style={styles.eyebrow}>Graphite Mix</p>
+						<p style={styles.eyebrow}>Find the coach who sees what you are capable of</p>
 						<h1
 							id="coach-map-intro-title"
 							style={{
@@ -2023,8 +2023,7 @@ export default function App() {
 							Strength Coach Discovery
 						</h1>
 						<p style={{ ...styles.description, fontSize: 16, maxWidth: 460 }}>
-							A minimal graphite map for finding powerlifting, strength,
-							bodybuilding, and lifestyle coaches by location.
+							Connect with coaches who know how to turn raw effort into structure, discipline, and progress you can feel under the bar.
 						</p>
 						<div style={styles.stats}>
 							<div style={styles.stat}>
@@ -2036,8 +2035,8 @@ export default function App() {
 								<span style={styles.statLabel}>Coaches</span>
 							</div>
 							<div style={styles.stat}>
-								<strong style={styles.statStrong}>4.8</strong>
-								<span style={styles.statLabel}>Avg rating</span>
+								<strong style={styles.statStrong}>100%</strong>
+								<span style={styles.statLabel}>Verified coaches</span>
 							</div>
 						</div>
 					</section>
