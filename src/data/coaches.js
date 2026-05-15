@@ -109,7 +109,7 @@ export const coaches = [
 	{
 		id: "coach7",
 		name: "Ari Kim",
-		title: "Olympic Weightlifting Coach",
+		title: "Weightlifting Coach",
 		city: "San Diego",
 		state: "California",
 		stateAbbr: "CA",
@@ -126,7 +126,7 @@ export const coaches = [
 	{
 		id: "coach8",
 		name: "Dante Wallace",
-		title: "Body Recomposition Coach",
+		title: "Bodybuilding Coach",
 		city: "Dallas",
 		state: "Texas",
 		stateAbbr: "TX",
@@ -148,19 +148,14 @@ export const coaches = [
 	{
 		id: "coach9",
 		name: "Sofia Ramirez",
-		title: "Return-to-Sport Specialist",
+		title: "Olympic Lifting",
 		city: "Alpharetta",
 		state: "Georgia",
 		stateAbbr: "GA",
 		coords: [34.0754, -84.2941],
 		rating: 4.9,
 		headshot: "https://randomuser.me/api/portraits/women/36.jpg",
-		specialties: [
-			"Return to Sport",
-			"Strength",
-			"Mobility",
-			"Injury Prevention",
-		],
+		specialties: ["Strength", "Mobility", "Injury Prevention"],
 		bio: "Coach focused on helping athletes rebuild strength, confidence, and movement quality after time away from training.",
 		experience: "8 years",
 		roster: 27,
@@ -187,7 +182,7 @@ export const coaches = [
 	{
 		id: "coach11",
 		name: "Keisha Grant",
-		title: "Performance & Speed Coach",
+		title: "Olympic Lifting",
 		city: "Savannah",
 		state: "Georgia",
 		stateAbbr: "GA",
