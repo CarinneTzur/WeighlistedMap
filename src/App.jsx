@@ -1,6 +1,9 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import L from "leaflet";
 import "leaflet/dist/leaflet.css";
+import "leaflet.markercluster/dist/MarkerCluster.css";
+import "leaflet.markercluster/dist/MarkerCluster.Default.css";
+import "leaflet.markercluster";
 import {
 	getAllCoaches,
 	getStateByAbbr,
@@ -91,10 +94,7 @@ const STATE_LABEL_COORD_OVERRIDES = {
 	Alaska: [64.2, -152.2],
 };
 
-const STATE_LABEL_SIZE_OVERRIDES = {
-	Michigan: 0.72,
-	Florida: 0.78,
-};
+const STATE_LABEL_SIZE_OVERRIDES = { Michigan: 0.72, Florida: 0.78 };
 
 const SEMANTIC_SYNONYMS = {
 	barbell: [
@@ -198,18 +198,63 @@ const STOP_WORDS = new Set([
 	"training",
 ]);
 
+// --- Clustering ---
+// Grid-based clustering: at each zoom level, snap coach coords to a grid cell
+// and merge coaches that land in the same cell.
+const CLUSTER_GRID_SIZE_DEG = {
+	3: 8,
+	4: 5,
+	5: 2.5,
+	6: 1.2,
+	7: 0.6,
+	8: 0.3,
+};
+
+function clusterCoaches(coaches, zoom) {
+	const gridSize = CLUSTER_GRID_SIZE_DEG[Math.min(zoom, 8)] ?? 0;
+	if (!gridSize) {
+		// At high zoom, each coach is its own cluster
+		return coaches.map((coach) => ({
+			id: `single-${coach.id}`,
+			coaches: [coach],
+			lat: coach.coords[0],
+			lng: coach.coords[1],
+			count: 1,
+		}));
+	}
+
+	const cells = new Map();
+	coaches.forEach((coach) => {
+		const cellLat =
+			Math.floor(coach.coords[0] / gridSize) * gridSize + gridSize / 2;
+		const cellLng =
+			Math.floor(coach.coords[1] / gridSize) * gridSize + gridSize / 2;
+		const key = `${cellLat.toFixed(4)},${cellLng.toFixed(4)}`;
+		if (!cells.has(key)) {
+			cells.set(key, { coaches: [], lat: cellLat, lng: cellLng });
+		}
+		cells.get(key).coaches.push(coach);
+	});
+
+	return Array.from(cells.entries()).map(([key, cell]) => ({
+		id: `cluster-${key}`,
+		coaches: cell.coaches,
+		lat: cell.lat,
+		lng: cell.lng,
+		count: cell.coaches.length,
+	}));
+}
+
 function useIsDesktop() {
 	const [isDesktop, setIsDesktop] = useState(
 		typeof window !== "undefined" ? window.innerWidth >= 1024 : true,
 	);
-
 	useEffect(() => {
 		const handleResize = () => setIsDesktop(window.innerWidth >= 1024);
 		handleResize();
 		window.addEventListener("resize", handleResize);
 		return () => window.removeEventListener("resize", handleResize);
 	}, []);
-
 	return isDesktop;
 }
 
@@ -228,15 +273,14 @@ function tokenizeText(text) {
 		.toLowerCase()
 		.split(/[^a-z0-9]+/i)
 		.map(normalizeToken)
-		.filter((token) => token.length > 1 && !STOP_WORDS.has(token));
+		.filter((t) => t.length > 1 && !STOP_WORDS.has(t));
 }
 
 function expandTokens(tokens) {
 	const expanded = [];
 	tokens.forEach((token) => {
 		expanded.push({ token, weight: 1 });
-		const synonyms = SEMANTIC_SYNONYMS[token] || [];
-		synonyms.forEach((synonym) => {
+		(SEMANTIC_SYNONYMS[token] || []).forEach((synonym) => {
 			expanded.push({ token: normalizeToken(synonym), weight: 0.72 });
 		});
 	});
@@ -267,20 +311,18 @@ function buildWeightedVector(weightedTokens, idfMap = {}) {
 }
 
 function cosineSimilarity(vectorA, vectorB) {
-	let dot = 0;
-	let magnitudeA = 0;
-	let magnitudeB = 0;
-
+	let dot = 0,
+		magA = 0,
+		magB = 0;
 	Object.entries(vectorA).forEach(([token, value]) => {
 		dot += value * (vectorB[token] || 0);
-		magnitudeA += value * value;
+		magA += value * value;
 	});
 	Object.values(vectorB).forEach((value) => {
-		magnitudeB += value * value;
+		magB += value * value;
 	});
-
-	if (!magnitudeA || !magnitudeB) return 0;
-	return dot / (Math.sqrt(magnitudeA) * Math.sqrt(magnitudeB));
+	if (!magA || !magB) return 0;
+	return dot / (Math.sqrt(magA) * Math.sqrt(magB));
 }
 
 function rankCoachesBySemanticSearch(coaches, query) {
@@ -299,8 +341,8 @@ function rankCoachesBySemanticSearch(coaches, query) {
 	});
 
 	const documentFrequency = {};
-	documents.forEach((document) => {
-		document.uniqueTokens.forEach((token) => {
+	documents.forEach((doc) => {
+		doc.uniqueTokens.forEach((token) => {
 			documentFrequency[token] = (documentFrequency[token] || 0) + 1;
 		});
 	});
@@ -316,46 +358,45 @@ function rankCoachesBySemanticSearch(coaches, query) {
 	const queryVector = buildWeightedVector(queryTokens, idfMap);
 
 	return documents
-		.map((document) => {
-			const coachVector = buildWeightedVector(document.tokens, idfMap);
-			const score = cosineSimilarity(queryVector, coachVector);
-			return { coach: document.coach, index: document.index, score };
+		.map((doc) => {
+			const coachVector = buildWeightedVector(doc.tokens, idfMap);
+			return {
+				coach: doc.coach,
+				index: doc.index,
+				score: cosineSimilarity(queryVector, coachVector),
+			};
 		})
 		.filter(({ score }) => score > 0.01)
-		.sort((a, b) => {
-			if (b.score !== a.score) return b.score - a.score;
-			return a.index - b.index;
-		})
+		.sort((a, b) =>
+			b.score !== a.score ? b.score - a.score : a.index - b.index,
+		)
 		.map(({ coach }) => coach);
 }
 
 function getOuterRingsFromGeometry(geometry) {
 	if (!geometry) return [];
-	if (geometry.type === "Polygon") {
+	if (geometry.type === "Polygon")
 		return geometry.coordinates?.[0] ? [geometry.coordinates[0]] : [];
-	}
 	if (geometry.type === "MultiPolygon") {
 		return geometry.coordinates
-			.map((polygon) => polygon?.[0])
-			.filter((ring) => Array.isArray(ring) && ring.length > 2);
+			.map((p) => p?.[0])
+			.filter((r) => Array.isArray(r) && r.length > 2);
 	}
 	return [];
 }
 
 function getRingAreaAndCentroid(ring) {
-	let doubledArea = 0;
-	let centroidLng = 0;
-	let centroidLat = 0;
-
-	for (let i = 0; i < ring.length - 1; i += 1) {
-		const [lng1, lat1] = ring[i];
-		const [lng2, lat2] = ring[i + 1];
+	let doubledArea = 0,
+		centroidLng = 0,
+		centroidLat = 0;
+	for (let i = 0; i < ring.length - 1; i++) {
+		const [lng1, lat1] = ring[i],
+			[lng2, lat2] = ring[i + 1];
 		const cross = lng1 * lat2 - lng2 * lat1;
 		doubledArea += cross;
 		centroidLng += (lng1 + lng2) * cross;
 		centroidLat += (lat1 + lat2) * cross;
 	}
-
 	if (Math.abs(doubledArea) < 0.000001) {
 		const total = ring.reduce(
 			(acc, [lng, lat]) => ({ lng: acc.lng + lng, lat: acc.lat + lat }),
@@ -366,7 +407,6 @@ function getRingAreaAndCentroid(ring) {
 			center: [total.lat / ring.length, total.lng / ring.length],
 		};
 	}
-
 	return {
 		area: Math.abs(doubledArea / 2),
 		center: [centroidLat / (3 * doubledArea), centroidLng / (3 * doubledArea)],
@@ -375,16 +415,13 @@ function getRingAreaAndCentroid(ring) {
 
 function getBestStateLabelLatLng(feature, fallbackCenter) {
 	const stateName = feature.properties.name;
-	if (STATE_LABEL_COORD_OVERRIDES[stateName]) {
+	if (STATE_LABEL_COORD_OVERRIDES[stateName])
 		return L.latLng(STATE_LABEL_COORD_OVERRIDES[stateName]);
-	}
 	const rings = getOuterRingsFromGeometry(feature.geometry);
 	if (!rings.length) return fallbackCenter;
-
 	const largestRing = rings
 		.map((ring) => ({ ring, ...getRingAreaAndCentroid(ring) }))
 		.sort((a, b) => b.area - a.area)[0];
-
 	if (!largestRing?.center) return fallbackCenter;
 	return L.latLng(largestRing.center[0], largestRing.center[1]);
 }
@@ -396,7 +433,7 @@ function runSelfTests() {
 		"CA state lookup should return California",
 	);
 	console.assert(
-		coaches.every((coach) => coach.state && coach.abbr),
+		coaches.every((c) => c.state && c.abbr),
 		"Every coach should include state metadata",
 	);
 	console.assert(
@@ -404,10 +441,7 @@ function runSelfTests() {
 		"State abbreviation lookup should include New York",
 	);
 }
-
-if (typeof window !== "undefined") {
-	runSelfTests();
-}
+if (typeof window !== "undefined") runSelfTests();
 
 const styles = {
 	shell: {
@@ -422,7 +456,7 @@ const styles = {
 	},
 	map: {
 		width: "100%",
-		height: "100vh",
+		height: "100dvh",
 		filter: "grayscale(1) contrast(1.05) brightness(0.82)",
 	},
 	introOverlay: {
@@ -623,7 +657,7 @@ const styles = {
 		gap: 22,
 		transition: "all 0.42s cubic-bezier(.66,.09,.28,1)",
 		backdropFilter: "blur(18px) saturate(130%)",
-		overflowY: "auto",
+		overflowY: "hidden",
 		overscrollBehavior: "contain",
 	},
 	glassPanelHidden: {
@@ -631,11 +665,7 @@ const styles = {
 		pointerEvents: "none",
 		opacity: 0,
 	},
-	glassPanelShown: {
-		transform: "none",
-		pointerEvents: "all",
-		opacity: 1,
-	},
+	glassPanelShown: { transform: "none", pointerEvents: "all", opacity: 1 },
 	backArrow: {
 		cursor: "pointer",
 		width: 38,
@@ -730,26 +760,15 @@ const styles = {
 		margin: 0,
 		filter: "grayscale(0.15)",
 	},
-	coachInfo: {
-		flex: 1,
-		minWidth: 0,
-	},
+	coachInfo: { flex: 1, minWidth: 0 },
 	coachName: {
 		fontWeight: 650,
 		fontSize: 17,
 		marginBottom: 2,
 		color: palette.text,
 	},
-	coachTitle: {
-		fontSize: 14,
-		color: palette.graphite100,
-		marginBottom: 3,
-	},
-	coachLocation: {
-		fontSize: 13,
-		color: palette.muted,
-		marginBottom: 4,
-	},
+	coachTitle: { fontSize: 14, color: palette.graphite100, marginBottom: 3 },
+	coachLocation: { fontSize: 13, color: palette.muted, marginBottom: 4 },
 	coachRating: {
 		fontSize: 13.5,
 		color: palette.graphite100,
@@ -757,12 +776,7 @@ const styles = {
 		marginBottom: 2,
 		marginLeft: 1,
 	},
-	tagList: {
-		display: "flex",
-		gap: 7,
-		flexWrap: "wrap",
-		marginTop: 7,
-	},
+	tagList: { display: "flex", gap: 7, flexWrap: "wrap", marginTop: 7 },
 	tag: {
 		display: "inline-block",
 		fontSize: 12.4,
@@ -858,6 +872,129 @@ const styles = {
 		letterSpacing: 0.1,
 		transition: "filter 160ms ease, transform 160ms ease",
 	},
+	contactPanel: {
+		display: "flex",
+		flexDirection: "column",
+		height: "100%",
+		minHeight: 0,
+		gap: 0,
+	},
+	contactTopRow: {
+		width: "100%",
+		display: "flex",
+		alignItems: "center",
+		justifyContent: "space-between",
+		marginBottom: 22,
+	},
+	contactHeader: {
+		display: "flex",
+		alignItems: "center",
+		gap: 14,
+		paddingBottom: 18,
+		borderBottom: "1px solid rgba(198,197,195,0.12)",
+	},
+	contactAvatar: {
+		width: 58,
+		height: 58,
+		borderRadius: "50%",
+		objectFit: "cover",
+		border: "2px solid rgba(198,197,195,0.22)",
+		background: palette.graphite800,
+		filter: "grayscale(0.08)",
+		flexShrink: 0,
+	},
+	contactName: {
+		fontSize: 18,
+		fontWeight: 760,
+		color: palette.text,
+		lineHeight: 1.15,
+		marginBottom: 5,
+	},
+	contactSpecialty: {
+		fontSize: 13,
+		color: palette.muted,
+		lineHeight: 1.35,
+	},
+	messageArea: {
+		flex: 1,
+		display: "flex",
+		flexDirection: "column",
+		justifyContent: "flex-end",
+		padding: "22px 0 0",
+		minHeight: 0,
+	},
+	messageHint: {
+		alignSelf: "center",
+		maxWidth: 300,
+		margin: "28px 0 auto",
+		padding: "14px 16px",
+		borderRadius: 18,
+		background: "rgba(198,197,195,0.055)",
+		border: `1px solid ${palette.border}`,
+		color: "rgba(242,241,239,0.72)",
+		fontSize: 13.5,
+		lineHeight: 1.45,
+		textAlign: "center",
+	},
+	messageSentBubble: {
+		alignSelf: "flex-end",
+		maxWidth: "86%",
+		padding: "12px 14px",
+		borderRadius: "18px 18px 6px 18px",
+		background: palette.graphite100,
+		color: palette.graphite900,
+		fontSize: 14,
+		lineHeight: 1.45,
+		fontWeight: 560,
+		boxShadow: "0 14px 32px rgba(0,0,0,0.26)",
+		whiteSpace: "pre-wrap",
+		wordBreak: "break-word",
+	},
+	messageInputWrap: {
+		display: "flex",
+		alignItems: "flex-end",
+		gap: 10,
+		paddingTop: 16,
+		borderTop: "1px solid rgba(198,197,195,0.10)",
+	},
+	messageInput: {
+		flex: 1,
+		minHeight: 52,
+		maxHeight: 112,
+		resize: "none",
+		overflowY: "hidden",
+		borderRadius: 18,
+		padding: "14px 15px",
+		outline: "none",
+		background: "rgba(30,28,30,0.76)",
+		border: `1px solid ${palette.border}`,
+		color: palette.text,
+		fontFamily: "inherit",
+		fontSize: 14.5,
+		lineHeight: 1.4,
+		boxShadow: "0 1.5px 8px rgba(0,0,0,0.22) inset",
+	},
+	sendButton: {
+		width: 54,
+		height: 54,
+		borderRadius: 999,
+		border: "none",
+		background: palette.graphite100,
+		color: palette.graphite900,
+		cursor: "pointer",
+		fontSize: 20,
+		fontWeight: 850,
+		display: "inline-flex",
+		alignItems: "center",
+		justifyContent: "center",
+		boxShadow: "0 16px 34px rgba(0,0,0,0.32)",
+		flexShrink: 0,
+	},
+	sendButtonDisabled: {
+		opacity: 0.45,
+		cursor: "not-allowed",
+		boxShadow: "none",
+	},
 	emptyState: {
 		color: "rgba(198,197,195,0.72)",
 		marginTop: 50,
@@ -867,16 +1004,25 @@ const styles = {
 	},
 	coachListPanelInner: {
 		overflowY: "auto",
-		maxHeight: "calc(100vh - 56px)",
+		height: "100%",
+		maxHeight: "100%",
 		overscrollBehaviorY: "contain",
 		paddingBottom: 6,
+	},
+	mobileSheetHandle: {
+		display: "block",
+		width: 42,
+		height: 4,
+		borderRadius: 999,
+		background: "rgba(198,197,195,0.22)",
+		margin: "0 auto 14px",
+		flexShrink: 0,
 	},
 };
 
 function CoachTag({ children }) {
 	return <span style={styles.tag}>{children}</span>;
 }
-
 function StarRating({ value }) {
 	return <span style={styles.coachRating}>★ {value}</span>;
 }
@@ -916,7 +1062,13 @@ function CoachCard({ coach, onClick, hovered, onMouseEnter, onMouseLeave }) {
 	);
 }
 
-function CoachProfile({ coach, onBack, isFavorite, onToggleFavorite }) {
+function CoachProfile({
+	coach,
+	onBack,
+	isFavorite,
+	onToggleFavorite,
+	onContact,
+}) {
 	return (
 		<div style={styles.profilePanel}>
 			<div style={styles.profileTopRow}>
@@ -969,7 +1121,148 @@ function CoachProfile({ coach, onBack, isFavorite, onToggleFavorite }) {
 					<span style={styles.profileStat}>Online coaching</span>
 				) : null}
 			</div>
-			<button style={styles.primaryButton}>Contact now</button>
+			<button
+				type="button"
+				style={styles.primaryButton}
+				onClick={() => onContact(coach)}
+			>
+				Contact now
+			</button>
+		</div>
+	);
+}
+
+function ContactPanel({ coach, onBack, isDesktop }) {
+	const messageInputRef = useRef(null);
+	const [message, setMessage] = useState(
+		`Hi ${coach.name.split(" ")[0]}, I found your profile on Weightlisted and wanted to ask about coaching.`,
+	);
+	const [sentMessage, setSentMessage] = useState("");
+
+	const primarySpecialty = coach.specialties?.[0] || coach.title || "Coach";
+	const specialtyLabel = coach.specialties?.length
+		? coach.specialties.slice(0, 2).join(" • ")
+		: coach.title;
+
+	function resizeMessageInput(textarea) {
+		if (!textarea) return;
+		const maxHeight = 112;
+		textarea.style.height = "auto";
+		const nextHeight = Math.min(textarea.scrollHeight, maxHeight);
+		textarea.style.height = `${nextHeight}px`;
+		textarea.style.overflowY =
+			textarea.scrollHeight > maxHeight ? "auto" : "hidden";
+	}
+
+	useEffect(() => {
+		resizeMessageInput(messageInputRef.current);
+	}, [message]);
+
+	function handleSend() {
+		const trimmed = message.trim();
+		if (!trimmed) return;
+		setSentMessage(trimmed);
+		setMessage("");
+	}
+
+	function handleMessageChange(event) {
+		setMessage(event.target.value);
+		resizeMessageInput(event.target);
+	}
+
+	function handleMessageKeyDown(event) {
+		if (event.key === "Enter" && event.ctrlKey) {
+			event.preventDefault();
+			handleSend();
+		}
+	}
+
+	return (
+		<div
+			style={{
+				...styles.contactPanel,
+				...(isDesktop ? {} : { minHeight: 0 }),
+			}}
+		>
+			<div style={styles.contactTopRow}>
+				<button
+					type="button"
+					style={styles.backArrow}
+					aria-label="Back to coach profile"
+					onClick={onBack}
+				>
+					←
+				</button>
+				<span
+					style={{
+						fontSize: 12,
+						color: palette.muted,
+						letterSpacing: "0.18em",
+						textTransform: "uppercase",
+					}}
+				>
+					Direct message
+				</span>
+			</div>
+
+			<div style={styles.contactHeader}>
+				<img
+					src={coach.headshot}
+					alt={coach.name}
+					style={styles.contactAvatar}
+					loading="lazy"
+				/>
+				<div style={{ minWidth: 0 }}>
+					<div style={styles.contactName}>{coach.name}</div>
+					<div style={styles.contactSpecialty}>
+						{primarySpecialty}
+						{specialtyLabel && specialtyLabel !== primarySpecialty
+							? ` • ${specialtyLabel}`
+							: ""}
+					</div>
+				</div>
+			</div>
+
+			<div
+				style={{
+					...styles.messageArea,
+					...(isDesktop ? {} : { paddingTop: 14 }),
+				}}
+			>
+				{sentMessage ? (
+					<div style={styles.messageSentBubble}>{sentMessage}</div>
+				) : (
+					<div style={styles.messageHint}>
+						Start with your goal, timeline, and whether you want in-person or
+						online coaching.
+					</div>
+				)}
+
+				<div style={styles.messageInputWrap}>
+					<textarea
+						ref={messageInputRef}
+						style={styles.messageInput}
+						placeholder="Type your message..."
+						value={message}
+						onChange={handleMessageChange}
+						onKeyDown={handleMessageKeyDown}
+						rows={1}
+						autoFocus
+					/>
+					<button
+						type="button"
+						style={{
+							...styles.sendButton,
+							...(!message.trim() ? styles.sendButtonDisabled : {}),
+						}}
+						onClick={handleSend}
+						disabled={!message.trim()}
+						aria-label="Send message"
+					>
+						➤
+					</button>
+				</div>
+			</div>
 		</div>
 	);
 }
@@ -987,9 +1280,22 @@ function CoachListPanel({
 	setProfileCoach,
 	favoriteCoachIds,
 	onToggleFavorite,
+	contactCoach,
+	setContactCoach,
+	isDesktop,
 	emptyMessage,
 }) {
 	const filtered = rankCoachesBySemanticSearch(coaches, search);
+
+	if (contactCoach) {
+		return (
+			<ContactPanel
+				coach={contactCoach}
+				onBack={() => setContactCoach(null)}
+				isDesktop={isDesktop}
+			/>
+		);
+	}
 
 	if (profileCoach) {
 		return (
@@ -998,6 +1304,7 @@ function CoachListPanel({
 				onBack={() => setProfileCoach(null)}
 				isFavorite={favoriteCoachIds.includes(profileCoach.id)}
 				onToggleFavorite={onToggleFavorite}
+				onContact={setContactCoach}
 			/>
 		);
 	}
@@ -1035,15 +1342,13 @@ function CoachListPanel({
 					</div>
 				</div>
 			</div>
-
 			<input
 				style={styles.searchInput}
-				placeholder="Describe what you want, like heavy lifting or female wellness…"
+				placeholder="Describe what you want, like heavy lifting or female wellness..."
 				value={search}
-				onChange={(event) => setSearch(event.target.value)}
+				onChange={(e) => setSearch(e.target.value)}
 				autoFocus
 			/>
-
 			<div>
 				{filtered.length === 0 ? (
 					<div style={styles.emptyState}>{emptyMessage}</div>
@@ -1052,7 +1357,10 @@ function CoachListPanel({
 					<CoachCard
 						key={coach.id}
 						coach={coach}
-						onClick={() => setProfileCoach(coach)}
+						onClick={() => {
+							setContactCoach(null);
+							setProfileCoach(coach);
+						}}
 						hovered={hoveredCoachId === coach.id}
 						onMouseEnter={() => setHoveredCoachId(coach.id)}
 						onMouseLeave={() => setHoveredCoachId(null)}
@@ -1063,22 +1371,29 @@ function CoachListPanel({
 	);
 }
 
-function createMarkerIcon(count, active = false) {
+function createClusterIcon(count, active = false) {
+	const isCluster = count > 1;
+	// Scale size slightly with count, capped
+	const size = active
+		? 38
+		: isCluster
+			? Math.min(28 + (count - 1) * 3, 46)
+			: 28;
+	const fontSize = isCluster ? Math.max(10, Math.min(14, size * 0.35)) : 11;
 	return L.divIcon({
 		className: "",
-		html: `<div class="coach-map-marker ${active ? "active" : ""}"><span>${count}</span></div>`,
-		iconSize: active ? [34, 34] : [28, 28],
-		iconAnchor: active ? [17, 17] : [14, 14],
+		html: `<div class="coach-map-marker${active ? " active" : ""}${isCluster ? " cluster" : ""}" style="width:${size}px;height:${size}px;font-size:${fontSize}px;"><span>${count}</span></div>`,
+		iconSize: [size, size],
+		iconAnchor: [size / 2, size / 2],
 	});
 }
 
 function getResponsiveStateLabelSize(map, bounds) {
-	const northWest = map.latLngToLayerPoint(bounds.getNorthWest());
-	const southEast = map.latLngToLayerPoint(bounds.getSouthEast());
-	const pixelWidth = Math.abs(southEast.x - northWest.x);
-	const pixelHeight = Math.abs(southEast.y - northWest.y);
+	const nw = map.latLngToLayerPoint(bounds.getNorthWest());
+	const se = map.latLngToLayerPoint(bounds.getSouthEast());
+	const pixelWidth = Math.abs(se.x - nw.x);
+	const pixelHeight = Math.abs(se.y - nw.y);
 	const smallestSide = Math.min(pixelWidth, pixelHeight);
-
 	return {
 		fontSize: Math.max(5, Math.min(12, smallestSide * 0.18)),
 		labelWidth: Math.max(12, Math.min(34, pixelWidth * 0.46)),
@@ -1110,40 +1425,47 @@ function addGlobalMapStyles() {
     .leaflet-control-zoom a:hover { background: ${palette.graphite700} !important; color: white !important; }
     .leaflet-popup-content-wrapper { background: ${palette.graphite900}; color: ${palette.text}; border: 1px solid ${palette.border}; border-radius: 16px; box-shadow: 0 18px 50px rgba(0,0,0,0.45); }
     .leaflet-popup-tip { background: ${palette.graphite900}; }
-    .coach-map-marker { width: 28px; height: 28px; border-radius: 999px; background: ${palette.graphite100}; border: 5px solid ${palette.graphite800}; box-shadow: 0 0 0 1px rgba(198,197,195,0.42), 0 12px 26px rgba(0,0,0,0.46); display: flex; align-items: center; justify-content: center; color: ${palette.graphite900}; font-size: 11px; font-weight: 800; }
-    .coach-map-marker.active { width: 34px; height: 34px; background: #F2F1EF; box-shadow: 0 0 0 1px rgba(198,197,195,0.66), 0 18px 40px rgba(0,0,0,0.56); }
+
+    .coach-map-marker {
+      border-radius: 999px;
+      background: ${palette.graphite100};
+      border: 5px solid ${palette.graphite800};
+      box-shadow: 0 0 0 1px rgba(198,197,195,0.42), 0 12px 26px rgba(0,0,0,0.46);
+      display: flex; align-items: center; justify-content: center;
+      color: ${palette.graphite900};
+      font-weight: 800;
+      transition: width 220ms ease, height 220ms ease, font-size 220ms ease;
+    }
+    .coach-map-marker.active {
+      background: #F2F1EF;
+      box-shadow: 0 0 0 1px rgba(198,197,195,0.66), 0 18px 40px rgba(0,0,0,0.56);
+    }
+    .coach-map-marker.cluster {
+      background: ${palette.graphite800};
+      border-color: ${palette.graphite700};
+      color: ${palette.text};
+      box-shadow: 0 0 0 2px rgba(198,197,195,0.28), 0 14px 32px rgba(0,0,0,0.52);
+    }
+
     .state-block-label { color: rgba(242,241,239,0.32); font-weight: 900; letter-spacing: 0.08em; text-transform: uppercase; text-align: center; text-shadow: 0 2px 6px rgba(0,0,0,0.62); pointer-events: none; user-select: none; white-space: nowrap; line-height: 1; transform: translate(-50%, -50%); transition: opacity 160ms ease, font-size 160ms ease; }
     .state-block-label.has-coaches { color: rgba(242,241,239,0.42); }
     .graphite-popup-title { margin: 0 0 5px; font-size: 15px; font-weight: 700; color: ${palette.text}; }
     .graphite-popup-meta { margin: 0; color: ${palette.muted}; font-size: 13px; line-height: 1.4; }
 
-    /* ── Hover tooltip wrapper: strip Leaflet defaults ── */
-    .coach-tooltip-wrapper {
-      background: transparent !important;
-      border: none !important;
-      box-shadow: none !important;
-      padding: 0 !important;
-    }
+    .coach-tooltip-wrapper { background: transparent !important; border: none !important; box-shadow: none !important; padding: 0 !important; }
     .coach-tooltip-wrapper::before { display: none !important; }
 
-    /* ── Hover tooltip card ── */
     .coach-hover-tooltip {
       pointer-events: none;
       background: linear-gradient(145deg, rgba(22,20,22,0.98), rgba(50,48,50,0.96));
-      border: 1px solid rgba(198,197,195,0.16);
-      border-radius: 18px;
-      padding: 14px 16px;
-      min-width: 220px;
-      max-width: 260px;
+      border: 1px solid rgba(198,197,195,0.16); border-radius: 18px; padding: 14px 16px;
+      min-width: 220px; max-width: 260px;
       box-shadow: 0 28px 64px rgba(0,0,0,0.58), 0 0 0 0.5px rgba(198,197,195,0.08);
       backdrop-filter: blur(20px);
       font-family: Inter, ui-sans-serif, system-ui, sans-serif;
       animation: tooltipFadeIn 140ms ease;
     }
-    @keyframes tooltipFadeIn {
-      from { opacity: 0; transform: translateY(4px); }
-      to   { opacity: 1; transform: translateY(0); }
-    }
+    @keyframes tooltipFadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
     .cht-header { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
     .cht-avatar { width: 44px; height: 44px; border-radius: 50%; object-fit: cover; border: 2px solid rgba(198,197,195,0.22); flex-shrink: 0; }
     .cht-name { font-size: 14px; font-weight: 700; color: #F2F1EF; margin: 0 0 1px; line-height: 1.2; }
@@ -1153,6 +1475,18 @@ function addGlobalMapStyles() {
     .cht-rating { font-size: 12px; font-weight: 650; color: #C6C5C3; margin: 0 0 9px; }
     .cht-tags { display: flex; gap: 5px; flex-wrap: wrap; }
     .cht-tag { font-size: 11px; font-weight: 600; padding: 3px 9px; background: rgba(198,197,195,0.07); color: #C6C5C3; border: 1px solid rgba(198,197,195,0.13); border-radius: 999px; }
+
+    .cluster-tooltip {
+      pointer-events: none;
+      background: linear-gradient(145deg, rgba(22,20,22,0.98), rgba(50,48,50,0.96));
+      border: 1px solid rgba(198,197,195,0.16); border-radius: 14px; padding: 10px 14px;
+      min-width: 140px;
+      box-shadow: 0 18px 44px rgba(0,0,0,0.52);
+      font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+      animation: tooltipFadeIn 140ms ease;
+    }
+    .cluster-tooltip-title { font-size: 13px; font-weight: 700; color: #F2F1EF; margin: 0 0 4px; }
+    .cluster-tooltip-sub { font-size: 11px; color: #A8A6A2; margin: 0; }
   `;
 	document.head.appendChild(style);
 	return style;
@@ -1167,9 +1501,12 @@ export default function App() {
 	const layersRef = useRef({
 		stateZones: [],
 		stateLabels: [],
-		coachMarkers: [],
+		clusterMarkers: [],
 	});
 	const selectedStateRef = useRef(null);
+	const allCoachesRef = useRef([]);
+	const showOnlineRef = useRef(false);
+	const renderClustersRef = useRef(null);
 
 	const [selectedState, setSelectedState] = useState(null);
 	const [search, setSearch] = useState("");
@@ -1181,24 +1518,43 @@ export default function App() {
 	const [favoriteCoachIds, setFavoriteCoachIds] = useState([]);
 	const [showIntroModal, setShowIntroModal] = useState(true);
 	const [showOnline, setShowOnline] = useState(false);
+	const [locationDropdownOpen, setLocationDropdownOpen] = useState(false);
+	const [clusterPanel, setClusterPanel] = useState(null);
+	const [contactCoach, setContactCoach] = useState(null);
 
 	const allCoaches = useMemo(() => getAllCoaches(), []);
 	const favoriteCoaches = useMemo(
-		() => allCoaches.filter((coach) => favoriteCoachIds.includes(coach.id)),
+		() => allCoaches.filter((c) => favoriteCoachIds.includes(c.id)),
 		[allCoaches, favoriteCoachIds],
-	);
-	const onlineCoaches = useMemo(
-		() => allCoaches.filter((coach) => coach.onlineTraining),
-		[allCoaches],
 	);
 
 	const panelVisible =
-		Boolean(selectedState) || favoritesOpen || semanticSearchOpen || showOnline;
+		Boolean(selectedState) ||
+		favoritesOpen ||
+		semanticSearchOpen ||
+		showOnline ||
+		Boolean(clusterPanel) ||
+		Boolean(contactCoach);
 	const state = selectedState ? getStateByAbbr(selectedState) : null;
 
 	useEffect(() => {
 		selectedStateRef.current = selectedState;
 	}, [selectedState]);
+	useEffect(() => {
+		allCoachesRef.current = allCoaches;
+	}, [allCoaches]);
+	useEffect(() => {
+		showOnlineRef.current = showOnline;
+		renderClustersRef.current?.();
+	}, [showOnline]);
+
+	useEffect(() => {
+		if (!mapRef.current) return undefined;
+		const timeout = window.setTimeout(() => {
+			mapRef.current?.invalidateSize();
+		}, 260);
+		return () => window.clearTimeout(timeout);
+	}, [isDesktop, panelVisible]);
 
 	useEffect(() => {
 		if (!mapNodeRef.current || mapRef.current) return undefined;
@@ -1212,23 +1568,133 @@ export default function App() {
 
 		L.tileLayer(
 			"https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
-			{
-				maxZoom: 20,
-			},
+			{ maxZoom: 20 },
 		).addTo(map);
 
 		const coaches = getAllCoaches();
+
+		// ---- Cluster rendering ----
+		function renderClusters() {
+			// Remove existing cluster markers
+			layersRef.current.clusterMarkers.forEach(({ layer }) => {
+				if (map.hasLayer(layer)) map.removeLayer(layer);
+			});
+			layersRef.current.clusterMarkers = [];
+
+			const zoom = map.getZoom();
+			const visibleCoaches = showOnlineRef.current
+				? coaches.filter((coach) => coach.onlineTraining)
+				: coaches;
+			const clusters = clusterCoaches(visibleCoaches, zoom);
+
+			clusters.forEach((cluster) => {
+				const { lat, lng, count, coaches: clusterCoaches } = cluster;
+				const isMulti = count > 1;
+
+				// Build tooltip HTML
+				let tooltipHtml;
+				if (isMulti) {
+					const stateLabel = clusterCoaches[0]?.state || "";
+					const cities = [...new Set(clusterCoaches.map((c) => c.city))];
+					const cityLabel =
+						cities.length === 1 ? cities[0] : `${cities.length} cities`;
+					tooltipHtml = `
+						<div class="cluster-tooltip">
+							<div class="cluster-tooltip-title">${count} coaches</div>
+							<div class="cluster-tooltip-sub">📍 ${cityLabel}${stateLabel ? `, ${stateLabel}` : ""}</div>
+						</div>`;
+				} else {
+					const coach = clusterCoaches[0];
+					tooltipHtml = `
+						<div class="coach-hover-tooltip">
+							<div class="cht-header">
+								<img class="cht-avatar" src="${coach.headshot}" alt="${coach.name}" />
+								<div>
+									<div class="cht-name">${coach.name}</div>
+									<div class="cht-title">${coach.title}</div>
+								</div>
+							</div>
+							<div class="cht-divider"></div>
+							<div class="cht-location">📍 ${coach.city}${coach.onlineTraining ? " · Online" : ""}</div>
+							<div class="cht-rating">★ ${coach.rating}${coach.experience ? " · " + coach.experience : ""}</div>
+							<div class="cht-tags">${(coach.specialties || []).map((s) => `<span class="cht-tag">${s}</span>`).join("")}</div>
+						</div>`;
+				}
+
+				const popupHtml = isMulti
+					? `<p class="graphite-popup-title">${count} coaches nearby</p><p class="graphite-popup-meta">${[...new Set(clusterCoaches.map((c) => c.city))].join(", ")}</p>`
+					: `<p class="graphite-popup-title">${clusterCoaches[0].name}</p><p class="graphite-popup-meta">${clusterCoaches[0].title}<br />${clusterCoaches[0].city}</p>`;
+
+				const marker = L.marker([lat, lng], { icon: createClusterIcon(count) })
+					.bindTooltip(tooltipHtml, {
+						direction: "top",
+						offset: [0, -Math.min(28 + (count - 1) * 3, 46) / 2 - 4],
+						opacity: 1,
+						className: "coach-tooltip-wrapper",
+					})
+					.bindPopup(popupHtml)
+					.on("click", () => {
+						if (isMulti) {
+							const cities = [...new Set(clusterCoaches.map((c) => c.city))];
+							const states = [...new Set(clusterCoaches.map((c) => c.state))];
+							const cityLabel =
+								cities.length === 1 ? cities[0] : `${cities.length} cities`;
+							const stateLabel =
+								states.length === 1 ? states[0] : `${states.length} states`;
+
+							setClusterPanel({
+								id: cluster.id,
+								coaches: clusterCoaches,
+								title: `${count} Coaches Nearby`,
+								eyebrow: `${cityLabel} • ${stateLabel}`,
+							});
+							setSelectedState(null);
+							setFavoritesOpen(false);
+							setSemanticSearchOpen(false);
+							setShowOnline(false);
+							setProfileCoach(null);
+							setContactCoach(null);
+							setSearch("");
+							setLocationDropdownOpen(false);
+							map.flyTo([lat, lng], Math.max(zoom, 6), { duration: 0.65 });
+						} else {
+							const coach = clusterCoaches[0];
+							const stateAbbr = coach.abbr;
+							setSelectedState(stateAbbr);
+							setClusterPanel(null);
+							setFavoritesOpen(false);
+							setSemanticSearchOpen(false);
+							setShowOnline(false);
+							setProfileCoach(coach);
+							setContactCoach(null);
+							setSearch("");
+							setLocationDropdownOpen(false);
+							map.flyTo(coach.coords, 10, { duration: 0.85 });
+						}
+					})
+					.addTo(map);
+
+				layersRef.current.clusterMarkers.push({
+					abbr: clusterCoaches[0]?.abbr,
+					layer: marker,
+					count,
+				});
+			});
+		}
+
+		// ---- State borders ----
 		const statesGeoJsonUrl =
 			"https://raw.githubusercontent.com/PublicaMundi/MappingAPI/master/data/geojson/us-states.json";
 
 		const updateStateLabels = () => {
 			layersRef.current.stateLabels.forEach(
-				({ abbr, stateName, layer, bounds, hasCoaches }) => {
+				({ stateName, layer, bounds, hasCoaches }) => {
 					const labelScale = STATE_LABEL_SIZE_OVERRIDES[stateName] || 1;
 					const { fontSize, labelWidth, opacity } = getResponsiveStateLabelSize(
 						map,
 						bounds,
 					);
+					const abbr = STATE_ABBR_BY_NAME[stateName];
 					layer.setIcon(
 						createStateLabelIcon({
 							abbr,
@@ -1243,14 +1709,12 @@ export default function App() {
 		};
 
 		fetch(statesGeoJsonUrl)
-			.then((response) => response.json())
+			.then((r) => r.json())
 			.then((geojson) => {
 				stateLayerRef.current = L.geoJSON(geojson, {
 					style: (feature) => {
 						const stateName = feature.properties.name;
-						const hasCoaches = coaches.some(
-							(coach) => coach.state === stateName,
-						);
+						const hasCoaches = coaches.some((c) => c.state === stateName);
 						return {
 							color: hasCoaches
 								? "rgba(218,220,215,0.48)"
@@ -1264,34 +1728,31 @@ export default function App() {
 					},
 					onEachFeature: (feature, layer) => {
 						const stateName = feature.properties.name;
-						const stateCoaches = coaches.filter(
-							(coach) => coach.state === stateName,
-						);
+						const stateCoaches = coaches.filter((c) => c.state === stateName);
 						if (!stateCoaches.length) return;
-
 						layer.on("click", () => {
 							const abbr = stateCoaches[0].abbr;
 							const stateItem = getStateByAbbr(abbr);
 							setSelectedState(abbr);
+							setClusterPanel(null);
 							setFavoritesOpen(false);
 							setSemanticSearchOpen(false);
 							setProfileCoach(null);
+							setContactCoach(null);
 							setSearch("");
-							setShowOnline(false);
+							setLocationDropdownOpen(false);
 							if (stateItem) map.flyTo(stateItem.center, 6, { duration: 0.85 });
 						});
-
-						layer.on("mouseover", () => {
+						layer.on("mouseover", () =>
 							layer.setStyle({
 								color: "rgba(217,189,125,0.88)",
 								fillColor: "rgba(217,189,125,0.12)",
 								weight: 1.3,
-							});
-						});
-
-						layer.on("mouseout", () => {
-							stateLayerRef.current?.resetStyle(layer);
-						});
+							}),
+						);
+						layer.on("mouseout", () =>
+							stateLayerRef.current?.resetStyle(layer),
+						);
 					},
 				}).addTo(map);
 
@@ -1303,8 +1764,7 @@ export default function App() {
 					const stateName = feature.properties.name;
 					const abbr = STATE_ABBR_BY_NAME[stateName];
 					if (!abbr) return;
-
-					const hasCoaches = coaches.some((coach) => coach.state === stateName);
+					const hasCoaches = coaches.some((c) => c.state === stateName);
 					const tempLayer = L.geoJSON(feature);
 					const bounds = tempLayer.getBounds();
 					const fallbackCenter = bounds.getCenter();
@@ -1337,80 +1797,39 @@ export default function App() {
 					});
 				});
 
-				map.on("zoomend", updateStateLabels);
+				map.on("zoomend", () => {
+					updateStateLabels();
+					renderClusters();
+				});
 				updateStateLabels();
+				renderClusters();
 			})
 			.catch(() => {
-				console.warn(
-					"State borders could not be loaded. Coach markers are still available.",
-				);
+				// State borders failed, still render clusters
+				map.on("zoomend", renderClusters);
+				renderClusters();
 			});
 
-		// ── Coach markers with hover tooltip ──
-		MOCK_STATES.forEach((stateItem) => {
-			stateItem.coaches.forEach((coach) => {
-				const tooltipHtml = `
-					<div class="coach-hover-tooltip">
-						<div class="cht-header">
-							<img class="cht-avatar" src="${coach.headshot}" alt="${coach.name}" />
-							<div>
-								<div class="cht-name">${coach.name}</div>
-								<div class="cht-title">${coach.title}</div>
-							</div>
-						</div>
-						<div class="cht-divider"></div>
-						<div class="cht-location">📍 ${coach.city}${coach.onlineTraining ? " · Online" : ""}</div>
-						<div class="cht-rating">★ ${coach.rating}${coach.experience ? " · " + coach.experience : ""}</div>
-						<div class="cht-tags">
-							${(coach.specialties || []).map((s) => `<span class="cht-tag">${s}</span>`).join("")}
-						</div>
-					</div>
-				`;
-
-				const marker = L.marker(coach.coords, { icon: createMarkerIcon(1) })
-					.bindTooltip(tooltipHtml, {
-						direction: "top",
-						offset: [0, -20],
-						opacity: 1,
-						className: "coach-tooltip-wrapper",
-					})
-					.bindPopup(
-						`<p class="graphite-popup-title">${coach.name}</p><p class="graphite-popup-meta">${coach.title}<br />${coach.city}</p>`,
-					)
-					.on("click", () => {
-						setSelectedState(stateItem.abbr);
-						setFavoritesOpen(false);
-						setSemanticSearchOpen(false);
-						setProfileCoach(coach);
-						setSearch("");
-						setShowOnline(false);
-						map.flyTo(coach.coords, 10, { duration: 0.85 });
-					})
-					.addTo(map);
-
-				layersRef.current.coachMarkers.push({
-					abbr: stateItem.abbr,
-					coachId: coach.id,
-					layer: marker,
-				});
-			});
-		});
-
+		renderClustersRef.current = renderClusters;
 		mapRef.current = map;
 
 		return () => {
-			map.off("zoomend", updateStateLabels);
+			map.off("zoomend");
 			map.remove();
 			mapRef.current = null;
 			stateLayerRef.current = null;
-			layersRef.current = { stateZones: [], stateLabels: [], coachMarkers: [] };
+			renderClustersRef.current = null;
+			layersRef.current = {
+				stateZones: [],
+				stateLabels: [],
+				clusterMarkers: [],
+			};
 			style.remove();
 		};
 	}, []);
 
 	useEffect(() => {
 		if (!mapRef.current) return;
-
 		const shouldShowStates = filter === "all" || filter === "states";
 		const shouldShowCoaches = filter === "all" || filter === "coaches";
 
@@ -1420,15 +1839,13 @@ export default function App() {
 			if (!shouldShowStates && mapRef.current.hasLayer(layer))
 				mapRef.current.removeLayer(layer);
 		});
-
 		layersRef.current.stateLabels.forEach(({ layer }) => {
 			if (shouldShowStates && !mapRef.current.hasLayer(layer))
 				layer.addTo(mapRef.current);
 			if (!shouldShowStates && mapRef.current.hasLayer(layer))
 				mapRef.current.removeLayer(layer);
 		});
-
-		layersRef.current.coachMarkers.forEach(({ layer }) => {
+		layersRef.current.clusterMarkers.forEach(({ layer }) => {
 			if (shouldShowCoaches && !mapRef.current.hasLayer(layer))
 				layer.addTo(mapRef.current);
 			if (!shouldShowCoaches && mapRef.current.hasLayer(layer))
@@ -1449,8 +1866,11 @@ export default function App() {
 		setFavoritesOpen(false);
 		setSemanticSearchOpen(false);
 		setProfileCoach(null);
+		setContactCoach(null);
 		setSearch("");
 		setShowOnline(false);
+		setClusterPanel(null);
+		setLocationDropdownOpen(false);
 		if (mapRef.current)
 			mapRef.current.flyTo([38.8, -96.5], 4, { duration: 0.8 });
 	}
@@ -1462,10 +1882,23 @@ export default function App() {
 		setFavoritesOpen(false);
 		setSemanticSearchOpen(false);
 		setProfileCoach(null);
+		setContactCoach(null);
 		setSearch("");
-		setShowOnline(false);
+		setClusterPanel(null);
+		setLocationDropdownOpen(false);
 		if (mapRef.current)
 			mapRef.current.flyTo(stateItem.center, 6, { duration: 0.85 });
+	}
+
+	function clearLocation() {
+		setSelectedState(null);
+		setProfileCoach(null);
+		setContactCoach(null);
+		setSearch("");
+		setClusterPanel(null);
+		setLocationDropdownOpen(false);
+		if (mapRef.current)
+			mapRef.current.flyTo([38.8, -96.5], 4, { duration: 0.8 });
 	}
 
 	function openFavoritesPanel() {
@@ -1473,8 +1906,11 @@ export default function App() {
 		setFavoritesOpen(true);
 		setSemanticSearchOpen(false);
 		setProfileCoach(null);
+		setContactCoach(null);
 		setSearch("");
 		setShowOnline(false);
+		setClusterPanel(null);
+		setLocationDropdownOpen(false);
 	}
 
 	function openSemanticSearchPanel() {
@@ -1482,49 +1918,82 @@ export default function App() {
 		setFavoritesOpen(false);
 		setSemanticSearchOpen(true);
 		setProfileCoach(null);
+		setContactCoach(null);
 		setShowOnline(false);
+		setClusterPanel(null);
+		setLocationDropdownOpen(false);
 	}
 
 	function openOnlinePanel() {
-		setSelectedState(null);
 		setFavoritesOpen(false);
 		setSemanticSearchOpen(false);
 		setProfileCoach(null);
-		setShowOnline(true);
+		setContactCoach(null);
 		setSearch("");
+		setClusterPanel(null);
+		setLocationDropdownOpen(false);
+		setShowOnline((current) => !current);
+		setFilter((current) => (current === "states" ? "all" : current));
 	}
 
-	const activePanelCoaches = semanticSearchOpen
-		? allCoaches
-		: favoritesOpen
-			? favoriteCoaches
-			: showOnline
-				? onlineCoaches
-				: state?.coaches || [];
+	const locationScopedCoaches = selectedState
+		? state?.coaches || []
+		: allCoaches;
+	const locationAndOnlineCoaches = showOnline
+		? locationScopedCoaches.filter((c) => c.onlineTraining)
+		: locationScopedCoaches;
+	const activePanelCoaches = clusterPanel
+		? clusterPanel.coaches
+		: semanticSearchOpen
+			? allCoaches
+			: favoritesOpen
+				? favoriteCoaches
+				: selectedState || showOnline
+					? locationAndOnlineCoaches
+					: [];
+	const activePanelTitle = clusterPanel
+		? clusterPanel.title
+		: semanticSearchOpen
+			? "Coach Search"
+			: favoritesOpen
+				? "Favorites"
+				: selectedState && showOnline
+					? `${state?.name} Online Training`
+					: selectedState
+						? state?.name || ""
+						: showOnline
+							? "Online Training"
+							: "";
+	const activePanelEyebrow = clusterPanel
+		? clusterPanel.eyebrow
+		: semanticSearchOpen
+			? "Semantic matches"
+			: favoritesOpen
+				? "Saved coaches"
+				: selectedState && showOnline
+					? "Location + remote coaches"
+					: selectedState
+						? "Selected location"
+						: showOnline
+							? "Remote coaches"
+							: "Selected filters";
+	const activePanelEmptyMessage = clusterPanel
+		? "No coaches found in this cluster."
+		: semanticSearchOpen
+			? "No matching coaches found. Try a broader phrase like strength, wellness, barbell, or performance."
+			: favoritesOpen
+				? "No favorites yet. Open a coach profile and tap the heart to save them here."
+				: selectedState && showOnline
+					? "No online training coaches found in this location."
+					: showOnline
+						? "No online training coaches found."
+						: "No matching coaches found.";
 
-	const activePanelTitle = semanticSearchOpen
-		? "Coach Search"
-		: favoritesOpen
-			? "Favorites"
-			: showOnline
-				? "Online Training"
-				: state?.name || "";
-
-	const activePanelEyebrow = semanticSearchOpen
-		? "Semantic matches"
-		: favoritesOpen
-			? "Saved coaches"
-			: showOnline
-				? "Remote coaches"
-				: "Selected state";
-
-	const activePanelEmptyMessage = semanticSearchOpen
-		? "No matching coaches found. Try a broader phrase like strength, wellness, barbell, or performance."
-		: favoritesOpen
-			? "No favorites yet. Open a coach profile and tap the heart to save them here."
-			: showOnline
-				? "No online training coaches found."
-				: "No matching coaches found.";
+	const isMobile = !isDesktop;
+	const mobilePanelHeight = contactCoach ? "82dvh" : "76dvh";
+	const mobileActionBottom = panelVisible
+		? `calc(${mobilePanelHeight} + 14px + env(safe-area-inset-bottom))`
+		: "calc(18px + env(safe-area-inset-bottom))";
 
 	return (
 		<main style={styles.shell}>
@@ -1578,12 +2047,29 @@ export default function App() {
 				</div>
 			) : null}
 
-			<div ref={mapNodeRef} style={styles.map} />
+			<div
+				ref={mapNodeRef}
+				style={{
+					...styles.map,
+					height: isMobile ? "100dvh" : styles.map.height,
+				}}
+			/>
 
 			<button
 				type="button"
 				style={{
 					...styles.semanticSearchButton,
+					...(isMobile
+						? {
+								left: 14,
+								right: "auto",
+								bottom: mobileActionBottom,
+								width: "calc(50vw - 22px)",
+								justifyContent: "center",
+								padding: "13px 12px",
+								fontSize: 13,
+							}
+						: {}),
 					...(semanticSearchOpen ? styles.semanticSearchButtonActive : {}),
 				}}
 				onClick={openSemanticSearchPanel}
@@ -1593,13 +2079,33 @@ export default function App() {
 				<span>Search coaches</span>
 			</button>
 
-			<nav style={styles.controls} aria-label="Map filters">
+			<nav
+				style={{
+					...styles.controls,
+					...(isMobile
+						? {
+								left: 14,
+								right: 14,
+								bottom: panelVisible
+									? `calc(${mobilePanelHeight} + 74px + env(safe-area-inset-bottom))`
+									: "calc(78px + env(safe-area-inset-bottom))",
+								justifyContent: "center",
+								gap: 6,
+								padding: 6,
+							}
+						: {}),
+				}}
+				aria-label="Map filters"
+			>
 				{["all", "states", "coaches"].map((item) => (
 					<button
 						key={item}
 						onClick={() => setFilter(item)}
 						style={{
 							...styles.controlButton,
+							...(isMobile
+								? { flex: 1, padding: "10px 8px", fontSize: 12 }
+								: {}),
 							...(filter === item ? styles.activeControl : {}),
 						}}
 					>
@@ -1610,7 +2116,20 @@ export default function App() {
 
 			<button
 				type="button"
-				style={styles.favoritesBar}
+				style={{
+					...styles.favoritesBar,
+					...(isMobile
+						? {
+								left: "auto",
+								right: 14,
+								bottom: mobileActionBottom,
+								width: "calc(50vw - 22px)",
+								justifyContent: "center",
+								padding: "13px 12px",
+								fontSize: 13,
+							}
+						: {}),
+				}}
 				onClick={openFavoritesPanel}
 				aria-label="Open favorite coaches"
 			>
@@ -1622,43 +2141,164 @@ export default function App() {
 				style={{
 					position: "absolute",
 					zIndex: 900,
-					right: isDesktop && panelVisible ? 458 : 24,
-					top: 24,
+					...(isMobile
+						? {
+								left: 14,
+								right: 14,
+								top: "calc(12px + env(safe-area-inset-top))",
+							}
+						: {
+								right: isDesktop && panelVisible ? 458 : 24,
+								top: 24,
+							}),
 					display: "flex",
 					flexDirection: "column",
+					alignItems: isMobile ? "stretch" : "flex-start",
 					gap: 10,
 					transition: "right 0.42s cubic-bezier(.66,.09,.28,1)",
 				}}
 			>
-				<div style={{ display: "flex", gap: 10 }}>
-					{MOCK_STATES.map((stateItem) => (
-						<button
-							key={stateItem.abbr}
-							onClick={() => selectState(stateItem.abbr)}
+				<div
+					style={{
+						display: "flex",
+						flexDirection: isMobile ? "row" : "column",
+						gap: 10,
+						width: isMobile ? "100%" : "auto",
+					}}
+				>
+					<button
+						type="button"
+						onClick={() => setLocationDropdownOpen((current) => !current)}
+						style={{
+							border: `1px solid ${selectedState ? "rgba(198,197,195,0.46)" : palette.border}`,
+							background: selectedState
+								? palette.graphite100
+								: "rgba(30,28,30,0.82)",
+							color: selectedState ? palette.graphite900 : palette.text,
+							borderRadius: 999,
+							padding: "13px 17px",
+							cursor: "pointer",
+							backdropFilter: "blur(14px)",
+							boxShadow: "0 14px 36px rgba(0,0,0,0.25)",
+							fontWeight: 750,
+							fontSize: 15,
+							minWidth: 184,
+							display: "inline-flex",
+							alignItems: "center",
+							justifyContent: "center",
+						}}
+						aria-expanded={locationDropdownOpen ? "true" : "false"}
+						aria-label="Choose coach location"
+					>
+						<span>
+							📍{" "}
+							{selectedState ? getStateByAbbr(selectedState)?.name : "Location"}
+						</span>
+					</button>
+
+					<div
+						style={{
+							overflow: "hidden",
+							...(isMobile
+								? {
+										position: "absolute",
+										left: 0,
+										right: 0,
+										top: 58,
+									}
+								: {}),
+							maxHeight: locationDropdownOpen ? (isMobile ? "42dvh" : 220) : 0,
+							opacity: locationDropdownOpen ? 1 : 0,
+							marginTop: locationDropdownOpen ? 0 : -4,
+							transition:
+								"max-height 0.32s cubic-bezier(0.4,0,0.2,1), opacity 0.22s ease, margin-top 0.22s ease",
+							pointerEvents: locationDropdownOpen ? "all" : "none",
+						}}
+					>
+						<div
 							style={{
-								border: `1px solid ${selectedState === stateItem.abbr ? "rgba(198,197,195,0.46)" : palette.border}`,
+								padding: 8,
+								borderRadius: 22,
 								background:
-									selectedState === stateItem.abbr
-										? palette.graphite100
-										: "rgba(30,28,30,0.82)",
-								color:
-									selectedState === stateItem.abbr
-										? palette.graphite900
-										: palette.text,
-								borderRadius: 999,
-								padding: "10px 13px",
-								cursor: "pointer",
-								backdropFilter: "blur(14px)",
-								boxShadow: "0 14px 36px rgba(0,0,0,0.25)",
-								fontWeight: 650,
+									"linear-gradient(145deg, rgba(30,28,30,0.97), rgba(55,53,55,0.94))",
+								border: `1px solid ${palette.border}`,
+								boxShadow: "0 24px 70px rgba(0,0,0,0.48)",
+								backdropFilter: "blur(18px)",
+								display: "flex",
+								flexDirection: "column",
+								gap: 4,
+								maxHeight: isMobile ? "40dvh" : 204,
+								overflowY: "auto",
+								overflowX: "hidden",
+								scrollbarWidth: "thin",
+								scrollbarColor: "rgba(198,197,195,0.2) transparent",
 							}}
 						>
-							{stateItem.abbr}
-						</button>
-					))}
-				</div>
-				<div style={{ display: "flex", gap: 10 }}>
+							{selectedState && (
+								<button
+									type="button"
+									onClick={clearLocation}
+									style={{
+										border: 0,
+										background: "transparent",
+										color: palette.muted,
+										borderRadius: 16,
+										padding: "10px 12px",
+										textAlign: "left",
+										cursor: "pointer",
+										fontWeight: 500,
+										fontSize: 14,
+										fontFamily: "inherit",
+									}}
+								>
+									Clear location
+								</button>
+							)}
+							{MOCK_STATES.map((stateItem) => {
+								const active = selectedState === stateItem.abbr;
+								return (
+									<button
+										key={stateItem.abbr}
+										type="button"
+										onClick={() => selectState(stateItem.abbr)}
+										style={{
+											border: `1px solid ${active ? "rgba(198,197,195,0.46)" : "transparent"}`,
+											background: active
+												? "rgba(198,197,195,0.12)"
+												: "rgba(198,197,195,0.045)",
+											color: palette.text,
+											borderRadius: 16,
+											padding: "11px 12px",
+											textAlign: "left",
+											cursor: "pointer",
+											fontWeight: 500,
+											fontSize: 14,
+											display: "flex",
+											alignItems: "center",
+											justifyContent: "space-between",
+											gap: 10,
+											flexShrink: 0,
+											fontFamily: "inherit",
+										}}
+									>
+										<span>{stateItem.name}</span>
+										<span
+											style={{
+												color: active ? palette.graphite100 : palette.muted,
+												fontSize: 12,
+												fontWeight: 500,
+											}}
+										>
+											{stateItem.abbr}
+										</span>
+									</button>
+								);
+							})}
+						</div>
+					</div>
+
 					<button
+						type="button"
 						onClick={openOnlinePanel}
 						style={{
 							border: `1px solid ${showOnline ? "rgba(198,197,195,0.46)" : palette.border}`,
@@ -1667,12 +2307,17 @@ export default function App() {
 								: "rgba(30,28,30,0.82)",
 							color: showOnline ? palette.graphite900 : palette.text,
 							borderRadius: 999,
-							padding: "10px 13px",
+							padding: "13px 17px",
 							cursor: "pointer",
 							backdropFilter: "blur(14px)",
 							boxShadow: "0 14px 36px rgba(0,0,0,0.25)",
-							fontWeight: 650,
-							minWidth: 132,
+							fontWeight: 750,
+							fontSize: 15,
+							minWidth: 184,
+							display: "inline-flex",
+							alignItems: "center",
+							justifyContent: "center",
+							gap: 9,
 						}}
 						aria-pressed={showOnline ? "true" : "false"}
 					>
@@ -1685,7 +2330,8 @@ export default function App() {
 				style={{
 					...styles.glassPanel,
 					width: isDesktop ? 430 : "100vw",
-					height: isDesktop ? "100vh" : "72vh",
+					height: isDesktop ? "100vh" : mobilePanelHeight,
+					maxHeight: isDesktop ? "100vh" : "calc(100dvh - 84px)",
 					top: isDesktop ? 0 : "auto",
 					bottom: isDesktop ? "auto" : 0,
 					right: 0,
@@ -1693,7 +2339,9 @@ export default function App() {
 					borderTop: isDesktop ? "none" : `1px solid ${palette.border}`,
 					borderTopLeftRadius: isDesktop ? 0 : 24,
 					borderTopRightRadius: isDesktop ? 0 : 24,
-					padding: isDesktop ? "34px 34px 22px" : "24px 18px 20px",
+					padding: isDesktop
+						? "34px 34px 22px"
+						: "10px 16px calc(18px + env(safe-area-inset-bottom))",
 					...(panelVisible
 						? styles.glassPanelShown
 						: {
@@ -1703,6 +2351,9 @@ export default function App() {
 				}}
 				aria-hidden={!panelVisible}
 			>
+				{isMobile && panelVisible ? (
+					<span style={styles.mobileSheetHandle} />
+				) : null}
 				{panelVisible ? (
 					<CoachListPanel
 						title={activePanelTitle}
@@ -1717,6 +2368,9 @@ export default function App() {
 						setHoveredCoachId={setHoveredCoachId}
 						favoriteCoachIds={favoriteCoachIds}
 						onToggleFavorite={toggleFavoriteCoach}
+						contactCoach={contactCoach}
+						setContactCoach={setContactCoach}
+						isDesktop={isDesktop}
 						emptyMessage={activePanelEmptyMessage}
 					/>
 				) : null}
